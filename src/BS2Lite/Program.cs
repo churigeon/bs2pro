@@ -2,9 +2,12 @@
 using System;
 using System.Collections.Generic;
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Drawing;
 using System.IO;
 using System.Linq;
+using System.Security;
+using System.Security.Principal;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
@@ -35,32 +38,26 @@ internal static class Program
     private static int Main(string[] args)
     {
         Directory.CreateDirectory(DataDirectory);
-
-        bool showOnStart = args.Length == 0;
-
-        if (args.Length > 0)
+        string command = args.Length > 0 ? args[0].ToLowerInvariant() : string.Empty;
+        if (command == "--status")
         {
-            string command = args[0].ToLowerInvariant();
-            if (command == "--status")
-            {
-                Console.WriteLine(File.Exists(StatusPath) ? File.ReadAllText(StatusPath, Encoding.UTF8) : "尚未生成状态");
-                return 0;
-            }
-            if (command == "--stop") return Signal(StopEventName);
-            if (command == "--pause") return Signal(PauseEventName);
-            if (command == "--resume") return Signal(ResumeEventName);
-            if (command == "--reconnect") return Signal(ReconnectEventName);
-            if (command == "--show")
-            {
-                StartupRegistration.EnsureCurrentExecutable();
-                int result = Signal(ShowEventName);
-                if (result == 0) return 0;
-                showOnStart = true;
-            }
-            else if (command == "--background") showOnStart = false;
+            Console.WriteLine(File.Exists(StatusPath) ? File.ReadAllText(StatusPath, Encoding.UTF8) : "尚未生成状态");
+            return 0;
         }
+        if (command == "--stop") return Signal(StopEventName);
+        if (command == "--pause") return Signal(PauseEventName);
+        if (command == "--resume") return Signal(ResumeEventName);
+        if (command == "--reconnect") return Signal(ReconnectEventName);
 
-        StartupRegistration.EnsureCurrentExecutable();
+        bool showOnStart = args.Length == 0 || command == "--show" || command == "--elevated-start";
+        bool background = command == "--background" || command == "--elevated-background";
+        if (showOnStart && Signal(ShowEventName, quiet: true) == 0) return 0;
+
+        if (!IsAdministrator())
+            return RelaunchElevated(background ? "--elevated-background" : "--elevated-start");
+
+        if (command == "--elevated-start" || command == "--elevated-background" || args.Length == 0)
+            StartupTaskRegistration.EnsureCurrentExecutable();
 
         using var mutex = new Mutex(true, @"Local\FlydigiBS2Lite_Instance", out bool firstInstance);
         if (!firstInstance)
@@ -77,7 +74,31 @@ internal static class Program
         return 0;
     }
 
-    private static int Signal(string eventName)
+    private static bool IsAdministrator()
+    {
+        using WindowsIdentity identity = WindowsIdentity.GetCurrent();
+        return new WindowsPrincipal(identity).IsInRole(WindowsBuiltInRole.Administrator);
+    }
+
+    private static int RelaunchElevated(string argument)
+    {
+        try
+        {
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = Application.ExecutablePath,
+                UseShellExecute = true,
+                Verb = "runas",
+                WorkingDirectory = AppDomain.CurrentDomain.BaseDirectory
+            };
+            startInfo.ArgumentList.Add(argument);
+            Process.Start(startInfo);
+            return 0;
+        }
+        catch { return 5; }
+    }
+
+    private static int Signal(string eventName, bool quiet = false)
     {
         try
         {
@@ -85,9 +106,9 @@ internal static class Program
             ev.Set();
             return 0;
         }
-        catch (WaitHandleCannotBeOpenedException)
+        catch (Exception ex) when (ex is WaitHandleCannotBeOpenedException || ex is UnauthorizedAccessException)
         {
-            Console.WriteLine("BS2 Lite 当前没有运行");
+            if (!quiet) Console.WriteLine("BS2 Lite 当前没有运行");
             return 2;
         }
     }
@@ -107,19 +128,68 @@ internal static class AppIcon
     }
 }
 
-internal static class StartupRegistration
+internal static class StartupTaskRegistration
 {
     private const string RunKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
     private const string ValueName = "FlydigiBS2Lite";
+    private const string TaskName = "FlydigiBS2LiteAutoStart";
 
     public static void EnsureCurrentExecutable()
     {
         try
         {
-            string command = $"\"{Application.ExecutablePath}\" --background";
-            using RegistryKey key = Registry.CurrentUser.CreateSubKey(RunKeyPath, true);
-            if (!string.Equals(key.GetValue(ValueName) as string, command, StringComparison.OrdinalIgnoreCase))
-                key.SetValue(ValueName, command, RegistryValueKind.String);
+            using WindowsIdentity identity = WindowsIdentity.GetCurrent();
+            string userId = SecurityElement.Escape(identity.User?.Value ?? identity.Name) ?? identity.Name;
+            string executable = SecurityElement.Escape(Application.ExecutablePath) ?? Application.ExecutablePath;
+            string workingDirectory = SecurityElement.Escape(AppDomain.CurrentDomain.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar)) ?? AppDomain.CurrentDomain.BaseDirectory;
+            string xml = $"""
+                <?xml version="1.0" encoding="UTF-16"?>
+                <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+                  <RegistrationInfo><Author>BS2 Lite</Author></RegistrationInfo>
+                  <Principals><Principal id="Author"><UserId>{userId}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
+                  <Settings>
+                    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+                    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+                    <Enabled>true</Enabled>
+                    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+                    <IdleSettings><Duration>PT10M</Duration><WaitTimeout>PT1H</WaitTimeout><StopOnIdleEnd>false</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings>
+                  </Settings>
+                  <Triggers><LogonTrigger /></Triggers>
+                  <Actions Context="Author"><Exec><Command>{executable}</Command><Arguments>--background</Arguments><WorkingDirectory>{workingDirectory}</WorkingDirectory></Exec></Actions>
+                </Task>
+                """;
+            string taskXmlPath = Path.Combine(Program.DataDirectory, "startup-task.xml");
+            File.WriteAllText(taskXmlPath, xml, Encoding.Unicode);
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = Path.Combine(Environment.SystemDirectory, "schtasks.exe"),
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            };
+            startInfo.ArgumentList.Add("/Create");
+            startInfo.ArgumentList.Add("/TN");
+            startInfo.ArgumentList.Add(TaskName);
+            startInfo.ArgumentList.Add("/XML");
+            startInfo.ArgumentList.Add(taskXmlPath);
+            startInfo.ArgumentList.Add("/F");
+            using Process? process = Process.Start(startInfo);
+            string output = process?.StandardOutput.ReadToEnd() ?? string.Empty;
+            string error = process?.StandardError.ReadToEnd() ?? string.Empty;
+            bool registered = process != null && process.WaitForExit(15000) && process.ExitCode == 0;
+            try { File.Delete(taskXmlPath); } catch { }
+
+            if (registered)
+            {
+                try { File.Delete(Path.Combine(Program.DataDirectory, "startup-task-error.log")); } catch { }
+                using RegistryKey key = Registry.CurrentUser.CreateSubKey(RunKeyPath, true);
+                key.DeleteValue(ValueName, false);
+            }
+            else
+            {
+                File.WriteAllText(Path.Combine(Program.DataDirectory, "startup-task-error.log"), output + Environment.NewLine + error, new UTF8Encoding(false));
+            }
         }
         catch { }
     }
@@ -167,7 +237,7 @@ internal sealed class TrayContext : ApplicationContext
         };
         _tray.DoubleClick += (_, _) => ShowPanel();
 
-        _timer = new System.Windows.Forms.Timer { Interval = 500 };
+        _timer = new System.Windows.Forms.Timer { Interval = 1000 };
         _timer.Tick += (_, _) => Tick();
         _timer.Start();
         _controller.Start();
@@ -253,8 +323,10 @@ internal sealed class CoolerController : IDisposable
     private const ushort NotifyUuid = 0xFFF1;
     private const ushort WriteUuid = 0xFFF2;
     private readonly object _gate = new();
+    private readonly object _logGate = new();
     private readonly CancellationTokenSource _cts = new();
     private readonly string _logPath = Path.Combine(Program.DataDirectory, "BS2Lite.log");
+    private readonly UpdateVisitor _temperatureVisitor = new();
     private WinRtBle? _ble;
     private Computer? _computer;
     private Task? _worker;
@@ -269,8 +341,18 @@ internal sealed class CoolerController : IDisposable
     private int _stopped;
     private bool _configured;
     private int _fanCommandFailures;
+    private int _lastPersistedStatusHash = int.MinValue;
+    private string _lastLogMessage = string.Empty;
+    private DateTime _lastLogTimeUtc = DateTime.MinValue;
 
     internal static readonly int[] FixedSpeeds = { 1300, 1700, 1900, 2100, 2400, 2700, 2800, 3000, 3300, 3500, 3700, 4000 };
+    private static readonly int[] TemperaturePoints = { 30, 40, 50, 60, 70, 80, 90, 100 };
+    private static readonly int[] Silent5V = { 1300, 1300, 1700, 2100, 2400, 2700, 2700, 2700 };
+    private static readonly int[] Silent9V = { 1300, 1300, 1700, 2100, 2700, 3000, 3300, 3300 };
+    private static readonly int[] Silent20V = { 1300, 1300, 1700, 2100, 2700, 3000, 3300, 3500 };
+    private static readonly int[] Performance5V = { 1300, 1700, 2100, 2400, 2700, 2700, 2700, 2700 };
+    private static readonly int[] Performance9V = { 1700, 1700, 2100, 2700, 3300, 3300, 3300, 3300 };
+    private static readonly int[] Performance20V = { 1700, 1700, 2100, 2700, 3300, 3500, 4000, 4000 };
     internal static readonly string[] FixedNames = { "静音1档", "静音2档", "静音3档", "标准1档", "标准2档", "标准3档", "强劲1档", "强劲2档", "强劲3档", "超频1档", "超频2档", "超频3档" };
 
     public ControllerStatus Status
@@ -281,6 +363,11 @@ internal sealed class CoolerController : IDisposable
     public LiteSettings Settings
     {
         get { lock (_gate) return _settings.Clone(); }
+    }
+
+    private LiteSettings CurrentSettings
+    {
+        get { lock (_gate) return _settings; }
     }
 
     public void UpdateSettings(LiteSettings settings)
@@ -294,7 +381,6 @@ internal sealed class CoolerController : IDisposable
 
     public void Start()
     {
-        SettingsStore.Save(Settings);
         _worker = Task.Run(() => RunAsync(_cts.Token));
     }
     public void Pause() { _paused = true; SetStatus(s => { s.Paused = true; s.Message = "已暂停；右键托盘图标可恢复"; }); }
@@ -350,18 +436,19 @@ internal sealed class CoolerController : IDisposable
                     continue;
                 }
 
-                LiteSettings settings = Settings;
+                LiteSettings settings = CurrentSettings;
                 if (_applyRequested)
                 {
                     if (ApplyDeviceSettings(settings)) _applyRequested = false;
                     else Log("Applying saved settings will be retried");
                 }
 
-                if ((DateTime.UtcNow - _lastPowerQuery).TotalSeconds >= 15)
+                if ((DateTime.UtcNow - _lastPowerQuery).TotalSeconds >= 60)
                     QueryPowerMode();
 
                 (double? cpu, double? gpu) = ReadTemperatures();
-                double controlTemp = Math.Max(cpu ?? 0, gpu ?? cpu ?? 0);
+                // The cooler follows CPU package temperature. GPU is only a safety fallback.
+                double controlTemp = cpu ?? gpu ?? 0;
                 int target;
                 if (settings.ControlMode == 0)
                 {
@@ -407,9 +494,13 @@ internal sealed class CoolerController : IDisposable
                     s.TargetRpm = _lastRpm > 0 ? _lastRpm : target;
                     s.PowerMode = PowerModeName(_powerMode);
                     s.ModeText = settings.ControlMode == 0 ? "智能变频 · " + settings.ProfileName : "固定转速 · " + FixedNames[settings.FixedLevel];
-                    s.Message = controlTemp > 0 ? "运行正常；设置会自动保存并在重连后恢复" : "未读取到温度，已使用安全转速 2700 rpm";
+                    s.Message = cpu.HasValue
+                        ? "运行正常；当前按 CPU 温度控制转速"
+                        : gpu.HasValue
+                            ? "CPU 温度不可用；暂时回退到 GPU 温度控制"
+                            : "未读取到温度，已使用安全转速 2700 rpm";
                 });
-                await Task.Delay(1000, token);
+                await Task.Delay(settings.ControlMode == 0 ? 2000 : 5000, token);
             }
             catch (OperationCanceledException) { break; }
             catch (Exception ex)
@@ -427,14 +518,19 @@ internal sealed class CoolerController : IDisposable
         SetStatus(s => { s.Connected = false; s.Message = "正在搜索 FlyDigi BS2PRO"; });
         try
         {
-            try { _ble?.Close(); } catch { }
+            try { _ble?.Dispose(); } catch { }
             _ble = new WinRtBle();
-            if (!_ble.Connect(ServiceUuid, NotifyUuid, WriteUuid)) return false;
+            if (!_ble.Connect(ServiceUuid, NotifyUuid, WriteUuid))
+            {
+                _ble.Dispose();
+                _ble = null;
+                return false;
+            }
 
             if (!TryCommand(5, null, 5)) throw new IOException("唤醒底座失败");
             QueryPowerMode();
             TryCommand(70, new byte[] { 0 }, 3);
-            if (!ApplyDeviceSettings(Settings)) throw new IOException("应用已保存设置失败");
+            if (!ApplyDeviceSettings(CurrentSettings)) throw new IOException("应用已保存设置失败");
             _applyRequested = false;
             _configured = true;
             _fanCommandFailures = 0;
@@ -457,8 +553,12 @@ internal sealed class CoolerController : IDisposable
             byte[]? payload = SendCommand(7, null);
             if (payload != null && payload.Length > 0 && payload[0] >= 1 && payload[0] <= 3)
             {
-                _powerMode = payload[0];
-                Log($"Power mode={_powerMode}");
+                int detectedMode = payload[0];
+                if (detectedMode != _powerMode)
+                {
+                    _powerMode = detectedMode;
+                    Log($"Power mode={_powerMode}");
+                }
                 break;
             }
             Thread.Sleep(50);
@@ -502,7 +602,6 @@ internal sealed class CoolerController : IDisposable
             byte[]? response = SendCommand(command, payload);
             if (response != null)
             {
-                Log($"ACK cmd={command:X2} payload={BitConverter.ToString(response)}");
                 if (response.Length == 0 || response[0] == 1 || response[0] == 3) return true;
             }
             Thread.Sleep(30);
@@ -547,8 +646,9 @@ internal sealed class CoolerController : IDisposable
     private void Disconnect(bool sendStop)
     {
         try { if (sendStop && IsConnected()) TryCommand(36, null, 2); } catch { }
-        try { _ble?.Close(); } catch { }
+        WinRtBle? ble = _ble;
         _ble = null;
+        try { ble?.Dispose(); } catch { }
         _lastRpm = 0;
         _configured = false;
         _fanCommandFailures = 0;
@@ -573,8 +673,7 @@ internal sealed class CoolerController : IDisposable
         if (_computer == null) return (null, null);
         try
         {
-            var visitor = new UpdateVisitor();
-            _computer.Accept(visitor);
+            _computer.Accept(_temperatureVisitor);
             double? cpu = null;
             double? gpu = null;
             foreach (IHardware hardware in _computer.Hardware.SelectMany(Flatten))
@@ -614,35 +713,17 @@ internal sealed class CoolerController : IDisposable
 
     private static int GetSmartRpm(double temperature, int powerMode, LiteSettings settings)
     {
-        int[] temperatures = { 30, 40, 50, 60, 70, 80, 90, 100 };
-        int[] rpms;
-        if (settings.SmartProfile == 2)
+        int[] rpms = settings.SmartProfile switch
         {
-            rpms = settings.CustomCurve.ToArray();
-        }
-        else if (settings.SmartProfile == 0)
-        {
-            rpms = powerMode switch
-            {
-                3 => new[] { 1300, 1300, 1700, 2100, 2700, 3000, 3300, 3500 },
-                2 => new[] { 1300, 1300, 1700, 2100, 2700, 3000, 3300, 3300 },
-                _ => new[] { 1300, 1300, 1700, 2100, 2400, 2700, 2700, 2700 }
-            };
-        }
-        else
-        {
-            rpms = powerMode switch
-            {
-                3 => new[] { 1700, 1700, 2100, 2700, 3300, 3500, 4000, 4000 },
-                2 => new[] { 1700, 1700, 2100, 2700, 3300, 3300, 3300, 3300 },
-                _ => new[] { 1300, 1700, 2100, 2400, 2700, 2700, 2700, 2700 }
-            };
-        }
+            2 => settings.CustomCurve,
+            0 => powerMode switch { 3 => Silent20V, 2 => Silent9V, _ => Silent5V },
+            _ => powerMode switch { 3 => Performance20V, 2 => Performance9V, _ => Performance5V }
+        };
         int powerLimit = powerMode == 3 ? 4000 : powerMode == 2 ? 3300 : 2700;
         int result = Math.Min(rpms[0], powerLimit);
-        for (int i = 0; i < temperatures.Length; i++)
+        for (int i = 0; i < TemperaturePoints.Length; i++)
         {
-            if (temperature < temperatures[i]) break;
+            if (temperature < TemperaturePoints[i]) break;
             result = Math.Min(rpms[i], powerLimit);
         }
         return result;
@@ -652,24 +733,42 @@ internal sealed class CoolerController : IDisposable
 
     private void SetStatus(Action<ControllerStatus> update)
     {
-        ControllerStatus snapshot;
+        ControllerStatus? snapshot = null;
         lock (_gate)
         {
             update(_status);
             _status.LastUpdated = DateTime.Now;
-            snapshot = _status.Copy();
+            int persistenceHash = HashCode.Combine(
+                _status.Connected, _status.Paused, _status.TargetRpm,
+                _status.PowerMode, _status.ModeText, _status.Message);
+            if (persistenceHash != _lastPersistedStatusHash)
+            {
+                _lastPersistedStatusHash = persistenceHash;
+                snapshot = _status.Copy();
+            }
         }
-        try { File.WriteAllText(Program.StatusPath, snapshot.ToJson(), new UTF8Encoding(false)); } catch { }
+        if (snapshot != null)
+        {
+            try { File.WriteAllText(Program.StatusPath, snapshot.ToJson(), new UTF8Encoding(false)); } catch { }
+        }
     }
 
     private void Log(string message)
     {
-        try
+        lock (_logGate)
         {
-            if (File.Exists(_logPath) && new FileInfo(_logPath).Length > 1024 * 1024) File.WriteAllText(_logPath, string.Empty);
-            File.AppendAllText(_logPath, $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} {message}{Environment.NewLine}", new UTF8Encoding(false));
+            try
+            {
+                DateTime now = DateTime.UtcNow;
+                if (string.Equals(message, _lastLogMessage, StringComparison.Ordinal) &&
+                    (now - _lastLogTimeUtc).TotalMinutes < 5) return;
+                _lastLogMessage = message;
+                _lastLogTimeUtc = now;
+                if (File.Exists(_logPath) && new FileInfo(_logPath).Length > 1024 * 1024) File.WriteAllText(_logPath, string.Empty);
+                File.AppendAllText(_logPath, $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} {message}{Environment.NewLine}", new UTF8Encoding(false));
+            }
+            catch { }
         }
-        catch { }
     }
 
     public void Dispose()
@@ -696,6 +795,7 @@ internal sealed class WinRtBle : IDisposable
     private readonly ConcurrentQueue<byte[]> _received = new();
     private readonly AutoResetEvent _receivedSignal = new(false);
     private BluetoothLEDevice? _device;
+    private GattDeviceService? _service;
     private GattCharacteristic? _writeCharacteristic;
     private GattCharacteristic? _notifyCharacteristic;
 
@@ -705,14 +805,15 @@ internal sealed class WinRtBle : IDisposable
     {
         try
         {
+            Close();
             _device = Wait(BluetoothLEDevice.FromBluetoothAddressAsync(DeviceAddress), 5000);
             if (_device == null) return false;
             Guid service = ShortUuid(serviceUuid);
             GattDeviceServicesResult services = Wait(_device.GetGattServicesForUuidAsync(service), 5000);
             if (services.Status != GattCommunicationStatus.Success || services.Services.Count == 0) return false;
 
-            GattDeviceService selectedService = services.Services[0];
-            GattCharacteristicsResult characteristics = Wait(selectedService.GetCharacteristicsAsync(), 5000);
+            _service = services.Services[0];
+            GattCharacteristicsResult characteristics = Wait(_service.GetCharacteristicsAsync(), 5000);
             if (characteristics.Status != GattCommunicationStatus.Success) return false;
             _writeCharacteristic = characteristics.Characteristics.FirstOrDefault(c => c.Uuid == ShortUuid(writeUuid));
             _notifyCharacteristic = characteristics.Characteristics.FirstOrDefault(c => c.Uuid == ShortUuid(notifyUuid));
@@ -763,18 +864,39 @@ internal sealed class WinRtBle : IDisposable
         }
         _notifyCharacteristic = null;
         _writeCharacteristic = null;
+        try { _service?.Dispose(); } catch { }
+        _service = null;
         try { _device?.Dispose(); } catch { }
         _device = null;
+        while (_received.TryDequeue(out _)) { }
+        _receivedSignal.Reset();
     }
 
     private void OnValueChanged(GattCharacteristic sender, GattValueChangedEventArgs args)
     {
         using DataReader reader = DataReader.FromBuffer(args.CharacteristicValue);
-        var bytes = new byte[reader.UnconsumedBufferLength];
-        reader.ReadBytes(bytes);
-        // 0xEF is the cooler's periodic telemetry frame, not an acknowledgement.
-        // The vendor client also discards it from the command-response queue.
-        if (bytes.Length >= 3 && bytes[2] == 0xEF) return;
+        int length = checked((int)reader.UnconsumedBufferLength);
+        if (length == 0) return;
+        if (length < 3)
+        {
+            var shortFrame = new byte[length];
+            reader.ReadBytes(shortFrame);
+            _received.Enqueue(shortFrame);
+            _receivedSignal.Set();
+            return;
+        }
+
+        byte first = reader.ReadByte();
+        byte second = reader.ReadByte();
+        byte command = reader.ReadByte();
+        // 0xEF is periodic telemetry. Check it before allocating a managed frame.
+        if (command == 0xEF) return;
+        var bytes = new byte[length];
+        bytes[0] = first;
+        bytes[1] = second;
+        bytes[2] = command;
+        for (int i = 3; i < length; i++) bytes[i] = reader.ReadByte();
+        while (_received.Count >= 32 && _received.TryDequeue(out _)) { }
         _received.Enqueue(bytes);
         _receivedSignal.Set();
     }
@@ -783,10 +905,21 @@ internal sealed class WinRtBle : IDisposable
 
     private static T Wait<T>(IAsyncOperation<T> operation, int timeoutMilliseconds)
     {
-        DateTime deadline = DateTime.UtcNow.AddMilliseconds(timeoutMilliseconds);
-        while (operation.Status == AsyncStatus.Started && DateTime.UtcNow < deadline) Thread.Sleep(10);
-        if (operation.Status != AsyncStatus.Completed) throw new TimeoutException(operation.Status.ToString());
-        return operation.GetResults();
+        try
+        {
+            DateTime deadline = DateTime.UtcNow.AddMilliseconds(timeoutMilliseconds);
+            while (operation.Status == AsyncStatus.Started && DateTime.UtcNow < deadline) Thread.Sleep(10);
+            if (operation.Status != AsyncStatus.Completed)
+            {
+                operation.Cancel();
+                throw new TimeoutException(operation.Status.ToString());
+            }
+            return operation.GetResults();
+        }
+        finally
+        {
+            operation.Close();
+        }
     }
 
     public void Dispose()
@@ -999,6 +1132,7 @@ internal static class SettingsStore
     {
         Directory.CreateDirectory(Program.DataDirectory);
         string json = JsonSerializer.Serialize(settings, new JsonSerializerOptions { WriteIndented = true });
+        if (File.Exists(PathName) && string.Equals(File.ReadAllText(PathName, Encoding.UTF8), json, StringComparison.Ordinal)) return;
         File.WriteAllText(PathName, json, new UTF8Encoding(false));
     }
 }
@@ -1029,7 +1163,6 @@ internal sealed class ControlPanelForm : Form
     private readonly CheckBox _powerOn = MakeCheck("通电自启动");
     private readonly Label _saved = MakeLabel(string.Empty, 10, TextMuted);
     private int _controlMode;
-    private bool _reallyClosing;
 
     public ControlPanelForm(CoolerController controller)
     {
@@ -1049,7 +1182,6 @@ internal sealed class ControlPanelForm : Form
         BuildLayout();
         if (Math.Abs(layoutScale - 1f) > 0.01f) ScaleChildBounds(this, layoutScale);
         LoadSettings(controller.Settings);
-        FormClosing += (_, e) => { if (!_reallyClosing) { e.Cancel = true; Hide(); } };
     }
 
     private static float GetDesktopDpiScale()
@@ -1150,7 +1282,7 @@ internal sealed class ControlPanelForm : Form
         apply.Click += (_, _) => SaveAndApply();
         var hide = MakeButton("隐藏到托盘");
         hide.SetBounds(28, 680, 278, 46);
-        hide.Click += (_, _) => Hide();
+        hide.Click += (_, _) => Close();
         _saved.SetBounds(32, 640, 560, 28);
         Controls.AddRange(new Control[] { _saved, hide, apply });
     }
@@ -1216,12 +1348,6 @@ internal sealed class ControlPanelForm : Form
         double temp = Math.Max(status.CpuTemperature ?? 0, status.GpuTemperature ?? 0);
         _reading.Text = $"{(temp > 0 ? temp.ToString("0") : "--")}°C  ·  {status.TargetRpm} rpm";
         _power.Text = status.PowerMode;
-    }
-
-    protected override void Dispose(bool disposing)
-    {
-        _reallyClosing = true;
-        base.Dispose(disposing);
     }
 
     private static Label MakeLabel(string text, float size, Color color) => new()
