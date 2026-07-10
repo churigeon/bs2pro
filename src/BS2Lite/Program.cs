@@ -11,6 +11,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using LibreHardwareMonitor.Hardware;
+using Microsoft.Win32;
 using System.Runtime.InteropServices;
 using Windows.Devices.Bluetooth;
 using Windows.Devices.Bluetooth.GenericAttributeProfile;
@@ -35,6 +36,8 @@ internal static class Program
     {
         Directory.CreateDirectory(DataDirectory);
 
+        bool showOnStart = args.Length == 0;
+
         if (args.Length > 0)
         {
             string command = args[0].ToLowerInvariant();
@@ -47,20 +50,29 @@ internal static class Program
             if (command == "--pause") return Signal(PauseEventName);
             if (command == "--resume") return Signal(ResumeEventName);
             if (command == "--reconnect") return Signal(ReconnectEventName);
-            if (command == "--show") return Signal(ShowEventName);
+            if (command == "--show")
+            {
+                StartupRegistration.EnsureCurrentExecutable();
+                int result = Signal(ShowEventName);
+                if (result == 0) return 0;
+                showOnStart = true;
+            }
+            else if (command == "--background") showOnStart = false;
         }
+
+        StartupRegistration.EnsureCurrentExecutable();
 
         using var mutex = new Mutex(true, @"Local\FlydigiBS2Lite_Instance", out bool firstInstance);
         if (!firstInstance)
         {
-            Signal(ShowEventName);
+            Signal(showOnStart ? ShowEventName : ResumeEventName);
             return 0;
         }
 
         Application.SetHighDpiMode(HighDpiMode.PerMonitorV2);
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
-        using var context = new TrayContext();
+        using var context = new TrayContext(showOnStart);
         Application.Run(context);
         return 0;
     }
@@ -85,8 +97,31 @@ internal static class AppIcon
 {
     public static Icon Load()
     {
-        string path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "BS2Lite.ico");
-        return File.Exists(path) ? new Icon(path) : (Icon)SystemIcons.Application.Clone();
+        try
+        {
+            using Icon? extracted = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
+            if (extracted != null) return (Icon)extracted.Clone();
+        }
+        catch { }
+        return (Icon)SystemIcons.Application.Clone();
+    }
+}
+
+internal static class StartupRegistration
+{
+    private const string RunKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
+    private const string ValueName = "FlydigiBS2Lite";
+
+    public static void EnsureCurrentExecutable()
+    {
+        try
+        {
+            string command = $"\"{Application.ExecutablePath}\" --background";
+            using RegistryKey key = Registry.CurrentUser.CreateSubKey(RunKeyPath, true);
+            if (!string.Equals(key.GetValue(ValueName) as string, command, StringComparison.OrdinalIgnoreCase))
+                key.SetValue(ValueName, command, RegistryValueKind.String);
+        }
+        catch { }
     }
 }
 
@@ -106,7 +141,7 @@ internal sealed class TrayContext : ApplicationContext
     private ControlPanelForm? _panel;
     private bool _closing;
 
-    public TrayContext()
+    public TrayContext(bool showOnStart)
     {
         _statusItem = new ToolStripMenuItem("正在启动……") { Enabled = false };
         var openPanel = new ToolStripMenuItem("打开控制面板", null, (_, _) => ShowPanel());
@@ -136,6 +171,7 @@ internal sealed class TrayContext : ApplicationContext
         _timer.Tick += (_, _) => Tick();
         _timer.Start();
         _controller.Start();
+        if (showOnStart) ShowPanel();
     }
 
     private void Tick()
