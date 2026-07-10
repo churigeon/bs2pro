@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="BS2 Lite cooler icon">
+  <defs>
+    <linearGradient id="card" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#25292e"/>
+      <stop offset="1" stop-color="#0d0f12"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="54" fill="url(#card)"/>
+  <path d="M82 195a79 79 0 1 1 92 0" fill="none" stroke="#f6a130" stroke-width="18" stroke-linecap="round"/>
+  <path d="M170 91a61 61 0 0 0-83 88" fill="none" stroke="#5fe4a3" stroke-width="10" stroke-linecap="round"/>
+  <g fill="#5fe4a3" transform="translate(128 128)">
+    <path d="M8-9C42-43 65-29 56 0 51 20 28 21 7 10 5 6 4 2 8-9Z"/>
+    <path d="M8-9C42-43 65-29 56 0 51 20 28 21 7 10 5 6 4 2 8-9Z" transform="rotate(120)"/>
+    <path d="M8-9C42-43 65-29 56 0 51 20 28 21 7 10 5 6 4 2 8-9Z" transform="rotate(240)"/>
+  </g>
+  <circle cx="128" cy="128" r="15" fill="#f6a130"/>
+  <circle cx="127" cy="122" r="4.5" fill="#fff" opacity=".9"/>
+  <path d="M58 204h55m30 0h55" fill="none" stroke="#5fe4a3" stroke-width="9" stroke-linecap="round"/>
+</svg>
